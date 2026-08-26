@@ -32,6 +32,7 @@ pub mod sleep_prevention;
 pub mod startup_trace;
 pub mod tray;
 mod webview_recovery;
+mod window_state_support;
 
 use bitfun_agent_runtime::sdk::{attach_session_event_cursor, SessionEventJournal};
 use bitfun_core::agentic::tools::computer_use_capability::set_computer_use_desktop_available;
@@ -49,7 +50,7 @@ use bitfun_transport::{TauriTransportAdapter, TransportAdapter};
 use serde::Deserialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
@@ -90,6 +91,9 @@ use api::subagent_api::*;
 use api::system_api::*;
 use api::tool_api::*;
 use startup_trace::{DesktopStartupTrace, DesktopStartupTraceSnapshot};
+
+pub(crate) const PLUGIN_HOST_LAUNCH_POLICY: bitfun_core::plugin_host::PluginHostLaunchPolicy =
+    bitfun_core::plugin_host::PluginHostLaunchPolicy::Disabled;
 
 /// Agentic Coordinator state
 #[derive(Clone)]
@@ -315,23 +319,82 @@ fn handle_secondary_launch(app: &tauri::AppHandle) {
     }
 }
 
+pub(crate) fn e2e_storage_guard_enabled() -> bool {
+    std::env::var("BITFUN_E2E_STORAGE_GUARD")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 fn main_window_state_flags() -> StateFlags {
-    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+    main_window_geometry_state_flags() | StateFlags::MAXIMIZED
 }
 
-fn persist_main_window_state(app: &tauri::AppHandle) -> Result<(), String> {
-    app.save_window_state(main_window_state_flags())
-        .map_err(|error| error.to_string())
+fn main_window_geometry_state_flags() -> StateFlags {
+    StateFlags::SIZE | StateFlags::POSITION | StateFlags::FULLSCREEN
 }
 
-pub(crate) fn save_main_window_state(app: &tauri::AppHandle) {
+/// Restore deliberately excludes `MAXIMIZED` on Windows: maximizing a hidden
+/// undecorated window does not survive `show()` and leaves Windows tracking a
+/// bogus normal-placement rect. Other platforms use the plugin's complete
+/// restore behavior.
+#[cfg(target_os = "windows")]
+fn main_window_restore_flags() -> StateFlags {
+    main_window_geometry_state_flags()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn main_window_restore_flags() -> StateFlags {
+    main_window_state_flags()
+}
+
+fn persist_main_window_state(app: &tauri::AppHandle, reason: &str) -> Result<(), String> {
+    persist_main_window_state_with_flags(app, reason, main_window_state_flags())
+}
+
+fn persist_main_window_geometry_state(app: &tauri::AppHandle, reason: &str) -> Result<(), String> {
+    persist_main_window_state_with_flags(app, reason, main_window_geometry_state_flags())
+}
+
+fn persist_main_window_state_with_flags(
+    app: &tauri::AppHandle,
+    reason: &str,
+    flags: StateFlags,
+) -> Result<(), String> {
+    let result = app
+        .save_window_state(flags)
+        .map_err(|error| error.to_string());
+    if let Err(error) = &result {
+        log::warn!(
+            "Failed to save main window state: reason={}, error={}",
+            reason,
+            error
+        );
+        return result;
+    }
+
+    #[cfg(target_os = "windows")]
+    if flags.contains(StateFlags::MAXIMIZED) {
+        window_state_support::correct_saved_main_window_state(app);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn save_main_window_state(app: &tauri::AppHandle, reason: &str) {
     if MAIN_WINDOW_USES_TRANSIENT_GEOMETRY.load(Ordering::SeqCst) {
-        log::debug!("Skipped saving transient main window geometry");
+        log::debug!(
+            "Skipped saving transient main window geometry: reason={}",
+            reason
+        );
         return;
     }
 
-    if let Err(error) = persist_main_window_state(app) {
-        log::warn!("Failed to save main window state: {}", error);
+    if let Err(error) = persist_main_window_state(app, reason) {
+        log::warn!(
+            "Failed to save main window state: reason={}, error={}",
+            reason,
+            error
+        );
     }
 }
 
@@ -346,7 +409,7 @@ pub(crate) fn set_main_window_transient_geometry(
 
         // Capture the latest normal bounds before toolbar mode starts resizing
         // the shared native window.
-        persist_main_window_state(app).map_err(|error| {
+        persist_main_window_state(app, "transient_geometry_enter_capture").map_err(|error| {
             format!(
                 "Failed to save main window state before transient geometry: {}",
                 error
@@ -357,7 +420,7 @@ pub(crate) fn set_main_window_transient_geometry(
     }
 
     MAIN_WINDOW_USES_TRANSIENT_GEOMETRY.store(false, Ordering::SeqCst);
-    persist_main_window_state(app).map_err(|error| {
+    persist_main_window_state(app, "transient_geometry_exit_persist").map_err(|error| {
         format!(
             "Failed to save restored main window state after transient geometry: {}",
             error
@@ -369,10 +432,17 @@ fn has_standard_main_window_size(width: f64, height: f64) -> bool {
     width >= MAIN_WINDOW_MIN_WIDTH && height >= MAIN_WINDOW_MIN_HEIGHT
 }
 
-pub(crate) fn restore_main_window_state(window: &tauri::WebviewWindow) {
-    if let Err(error) = window.restore_state(main_window_state_flags()) {
+pub(crate) fn restore_main_window_state(window: &tauri::WebviewWindow) -> bool {
+    if let Err(error) = window.restore_state(main_window_restore_flags()) {
         log::warn!("Failed to restore main window state: {}", error);
     }
+
+    #[cfg(target_os = "windows")]
+    let reapply_maximized =
+        window_state_support::read_persisted_main_maximized(window.app_handle()).unwrap_or(false);
+
+    #[cfg(not(target_os = "windows"))]
+    let reapply_maximized = false;
 
     let is_maximized = window.is_maximized().unwrap_or(false);
     let is_fullscreen = window.is_fullscreen().unwrap_or(false);
@@ -403,7 +473,10 @@ pub(crate) fn restore_main_window_state(window: &tauri::WebviewWindow) {
                         log::warn!("Failed to center reset main window: {}", error);
                     }
                     if resize_succeeded {
-                        if let Err(error) = persist_main_window_state(window.app_handle()) {
+                        if let Err(error) = persist_main_window_geometry_state(
+                            window.app_handle(),
+                            "startup_geometry_repair",
+                        ) {
                             log::warn!("Failed to persist repaired main window state: {}", error);
                         }
                     }
@@ -424,11 +497,17 @@ pub(crate) fn restore_main_window_state(window: &tauri::WebviewWindow) {
     ))) {
         log::warn!("Failed to set main window minimum size: {}", error);
     }
+
+    reapply_maximized
 }
 
 #[cfg(test)]
 mod main_window_geometry_tests {
-    use super::has_standard_main_window_size;
+    use super::{
+        has_standard_main_window_size, main_window_geometry_state_flags, main_window_restore_flags,
+        main_window_state_flags,
+    };
+    use tauri_plugin_window_state::StateFlags;
 
     #[test]
     fn floating_toolbar_sizes_are_not_valid_main_window_sizes() {
@@ -439,6 +518,24 @@ mod main_window_geometry_tests {
     #[test]
     fn default_client_size_is_a_valid_main_window_size() {
         assert!(has_standard_main_window_size(1200.0, 800.0));
+    }
+
+    #[test]
+    fn geometry_saves_do_not_overwrite_maximized_state() {
+        assert!(!main_window_geometry_state_flags().contains(StateFlags::MAXIMIZED));
+        assert!(main_window_state_flags().contains(StateFlags::MAXIMIZED));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_restore_defers_maximized_state_until_after_show() {
+        assert!(!main_window_restore_flags().contains(StateFlags::MAXIMIZED));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_restore_keeps_plugin_maximized_behavior() {
+        assert!(main_window_restore_flags().contains(StateFlags::MAXIMIZED));
     }
 }
 
@@ -527,6 +624,22 @@ pub async fn run() {
     }
     startup_timings.record_elapsed("initialize_global_config", step_started);
     startup_trace.record_elapsed_step("native_pre_tauri", "initialize_global_config", step_started);
+
+    let step_started = Instant::now();
+    match bitfun_core::plugin_host::initialize_configured_plugin_host_with_log_file(
+        PLUGIN_HOST_LAUNCH_POLICY,
+        Some(session_log_dir.join("plugin-host.log")),
+    )
+    .await
+    {
+        Ok(bitfun_core::plugin_host::PluginHostStartup::Disabled) => {}
+        Ok(status) => log::info!("Plugin host initialization completed: {:?}", status),
+        Err(error) => {
+            log::error!("Failed to initialize configured plugin host: {}", error);
+        }
+    }
+    startup_timings.record_elapsed("initialize_plugin_host", step_started);
+    startup_trace.record_elapsed_step("native_pre_tauri", "initialize_plugin_host", step_started);
 
     // The three steps below only depend on the global config service (initialized
     // above) and write to disjoint global singletons, so they can run concurrently:
@@ -697,8 +810,11 @@ pub async fn run() {
 
     let mut builder = tauri::Builder::default();
 
+    let is_e2e_webdriver =
+        e2e_storage_guard_enabled() && std::env::var_os("BITFUN_WEBDRIVER_PORT").is_some();
+
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    {
+    if !is_e2e_webdriver {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             log::info!(
                 "Existing BitFun Desktop instance received launch request: args_count={}, cwd={}",
@@ -1163,7 +1279,7 @@ pub async fn run() {
                 if window.label() == "main"
                     && matches!(event, tauri::WindowEvent::CloseRequested { .. })
                 {
-                    save_main_window_state(window.app_handle());
+                    save_main_window_state(window.app_handle(), "close_requested");
                 }
 
                 if let tauri::WindowEvent::CloseRequested { api: _api, .. } = event {
@@ -1924,11 +2040,15 @@ pub async fn run() {
 
     match app {
         Ok(app) => {
-            app.run(|_app_handle, event| match event {
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                    crash_diagnostics::mark_clean_shutdown("tauri_run_exit");
-                    save_main_window_state(_app_handle);
-                    perform_process_exit_cleanup();
+            app.run(|app_handle, event| match event {
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if !PROCESS_EXIT_CLEANUP_COMPLETE.load(Ordering::Acquire) {
+                        api.prevent_exit();
+                        request_desktop_exit(app_handle, code.unwrap_or(0), "tauri_exit_requested");
+                    }
+                }
+                tauri::RunEvent::Exit => {
+                    perform_process_exit_cleanup_emergency();
                 }
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen {
@@ -1940,7 +2060,7 @@ pub async fn run() {
                     } else {
                         "dock_reopen_no_visible_windows"
                     };
-                    show_main_window_on_macos(_app_handle, reason);
+                    show_main_window_on_macos(app_handle, reason);
                 }
                 _ => {}
             });
@@ -2004,29 +2124,14 @@ async fn init_agentic_system() -> anyhow::Result<(
         tool_pipeline.clone(),
     ));
 
-    // Get execution config from global settings
-    let exec_config = match bitfun_core::service::config::get_global_config_service().await {
-        Ok(config_service) => {
-            match config_service
-                .get_config::<bitfun_core::service::config::types::GlobalConfig>(None)
-                .await
-            {
-                Ok(global_config) => execution::ExecutionEngineConfig {
-                    max_rounds: global_config.ai.max_rounds,
-                    ..Default::default()
-                },
-                Err(_) => Default::default(),
-            }
-        }
-        Err(_) => Default::default(),
-    };
+    let execution_config = execution::execution_engine_config_from_global_config().await;
 
     let execution_engine = Arc::new(execution::ExecutionEngine::new(
         round_executor,
         event_queue.clone(),
         session_manager.clone(),
         context_compressor,
-        exec_config,
+        execution_config,
     ));
 
     let runtime_ownership = Arc::new(
@@ -2219,21 +2324,75 @@ fn setup_panic_hook() {
             return;
         }
 
-        perform_process_exit_cleanup();
+        perform_process_exit_cleanup_emergency();
         std::process::exit(1);
     }));
 }
 
-pub(crate) fn perform_process_exit_cleanup() -> bool {
-    static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+static PROCESS_EXIT_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+static PROCESS_EXIT_CLEANUP_COMPLETE: AtomicBool = AtomicBool::new(false);
+static DESKTOP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+static PROCESS_EXIT_CLEANUP_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 
-    if CLEANUP_DONE
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return false;
+pub(crate) async fn perform_process_exit_cleanup() -> bool {
+    let notify = PROCESS_EXIT_CLEANUP_NOTIFY.get_or_init(tokio::sync::Notify::new);
+    if PROCESS_EXIT_CLEANUP_STARTED.swap(true, Ordering::AcqRel) {
+        loop {
+            let notified = notify.notified();
+            if PROCESS_EXIT_CLEANUP_COMPLETE.load(Ordering::Acquire) {
+                return false;
+            }
+            notified.await;
+        }
     }
 
+    log::info!("Desktop process graceful shutdown started");
+    match bitfun_core::plugin_host::shutdown_configured_plugin_host().await {
+        Ok(Some(report)) => log::info!(
+            "Desktop plugin host shutdown completed: generation={}, disposition={:?}, rpc_completed={}, exit_code={:?}, duration_ms={}",
+            report.generation,
+            report.disposition,
+            report.rpc_completed,
+            report.exit_code,
+            report.duration_ms
+        ),
+        Ok(None) => log::debug!("Desktop plugin host shutdown skipped: host not started"),
+        Err(error) => log::warn!("Desktop plugin host shutdown failed: {}", error),
+    }
+    if let Some(search_service) = get_global_workspace_search_service() {
+        search_service.shutdown_blocking();
+    }
+    bitfun_core::util::process_manager::cleanup_all_processes();
+    api::remote_connect_api::cleanup_on_exit();
+    PROCESS_EXIT_CLEANUP_COMPLETE.store(true, Ordering::Release);
+    notify.notify_waiters();
+    log::info!("Desktop process graceful shutdown completed");
+    true
+}
+
+pub(crate) fn request_desktop_exit(app: &tauri::AppHandle, exit_code: i32, reason: &'static str) {
+    if DESKTOP_EXIT_REQUESTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    save_main_window_state(app, reason);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        perform_process_exit_cleanup().await;
+        crash_diagnostics::mark_clean_shutdown(reason);
+        log::info!(
+            "Desktop exit authorized after graceful shutdown: reason={}, exit_code={}",
+            reason,
+            exit_code
+        );
+        app.exit(exit_code);
+    });
+}
+
+pub(crate) fn perform_process_exit_cleanup_emergency() -> bool {
+    if PROCESS_EXIT_CLEANUP_COMPLETE.load(Ordering::Acquire) {
+        return false;
+    }
+    log::warn!("Desktop emergency process cleanup started");
     if let Some(search_service) = get_global_workspace_search_service() {
         search_service.shutdown_blocking();
     }
@@ -2558,6 +2717,14 @@ fn spawn_runtime_log_level_listener(default_level: log::LevelFilter) {
                     Ok(ConfigUpdateEvent::LogLevelUpdated { new_level }) => {
                         if let Some(level) = logging::parse_log_level(&new_level) {
                             logging::apply_runtime_log_level(level, "config_update_event");
+                            if let Err(error) =
+                                bitfun_core::plugin_host::set_configured_plugin_host_log_level(
+                                    logging::level_to_str(level),
+                                )
+                                .await
+                            {
+                                log::warn!("Failed to update plugin host log level: {}", error);
+                            }
                         } else {
                             log::warn!(
                                 "Received invalid log level from config update event: {}",
@@ -2568,6 +2735,14 @@ fn spawn_runtime_log_level_listener(default_level: log::LevelFilter) {
                     Ok(ConfigUpdateEvent::ConfigReloaded) => {
                         let level = resolve_runtime_log_level(default_level).await;
                         logging::apply_runtime_log_level(level, "config_reloaded");
+                        if let Err(error) =
+                            bitfun_core::plugin_host::set_configured_plugin_host_log_level(
+                                logging::level_to_str(level),
+                            )
+                            .await
+                        {
+                            log::warn!("Failed to update plugin host log level: {}", error);
+                        }
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -2650,6 +2825,10 @@ fn spawn_workspace_search_feature_listener(app_handle: tauri::AppHandle) {
                         {
                             match workspace_search_service.open_repo(&current_workspace).await {
                                 Ok(_) => {
+                                    workspace_search_service.schedule_auto_index(
+                                        &current_workspace,
+                                        bitfun_core::service::search::WorkspaceSearchAutoIndexPriority::Focused,
+                                    ).await;
                                     log::info!(
                                         "Workspace search feature enabled; warmed current workspace: path={}",
                                         current_workspace.display()

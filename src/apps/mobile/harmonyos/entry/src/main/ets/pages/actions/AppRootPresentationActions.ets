@@ -2,14 +2,12 @@ import { RemotePermissionMode, RemoteSession } from '../../model/RemoteModels';
 import { CloudAccountDevice } from '../../services/CloudAccountClient';
 import { DetectedUrlAction } from '../../services/ConnectScanDecisionPolicy';
 import { ConversationIntent } from './ConversationIntent';
-import { AppRoute, ConversationSource } from '../navigation/AppRouteContract';
+import { AppRoute } from '../navigation/AppRouteContract';
 
 export interface AppRootPresentationActions {
   readonly onNavigationBack: (route: AppRoute) => boolean;
   readonly onConversationIntent: (route: AppRoute, intent: ConversationIntent) => void;
   readonly onCloseSidebar: () => void;
-  readonly onWideConversationSource: (source: ConversationSource) => void;
-  readonly onCompactConversationSource: (source: ConversationSource) => void;
   readonly onCompactLayoutEntered: () => void;
   readonly onLayoutModeChanged: (wideLayout: boolean) => void;
   readonly onRemoteHome: RemoteHomePresentationActions;
@@ -48,7 +46,7 @@ export interface RemoteHomePresentationActions {
   readonly refresh: () => void;
   readonly showWorkspaces: () => void;
   readonly showAssistants: () => void;
-  readonly selectWorkspace: (path: string) => void;
+  readonly selectWorkspace: (path: string, deviceId?: string) => void;
   readonly selectAssistant: (path: string) => void;
   readonly cancelWorkspace: () => void;
   readonly cancelAssistant: () => void;
@@ -61,8 +59,10 @@ export interface RemoteHomePresentationActions {
   readonly create: (agentType: string) => void;
   readonly createInPlace: (agentType: string) => void;
   readonly createAssistant: () => void;
-  readonly createInWorkspace: (path: string, agentType: string) => void;
-  readonly createInWorkspaceInPlace: (path: string, agentType: string) => void;
+  readonly createInWorkspace: (path: string, agentType: string, deviceId?: string) => void;
+  readonly createInWorkspaceInPlace: (path: string, agentType: string, deviceId?: string) => void;
+  readonly toggleDirectoryDevice: (deviceId: string) => void;
+  readonly retryDirectoryDevice: (deviceId: string) => void;
   readonly openSession: (session: RemoteSession) => void;
   readonly openSessionInPlace: (session: RemoteSession) => void;
   readonly deleteSession: (session: RemoteSession) => void;
@@ -72,6 +72,10 @@ export interface SidebarPresentationActions {
   readonly close: () => void;
   readonly newChat: () => void;
   readonly enterCode: () => void;
+  /** Opens the QR scanner directly from sidebar device actions. */
+  readonly scanDesktop: () => void;
+  /** Opens the QR scanner from the device-section add button. */
+  readonly addDesktop: () => void;
   readonly settings: () => void;
   readonly openAccount: () => void;
   readonly openSession: (session: RemoteSession) => void;
@@ -94,10 +98,13 @@ export interface SettingsPresentationActions {
   readonly setPermissionMode: (mode: RemotePermissionMode) => Promise<RemotePermissionMode>;
   readonly testGeneral: (url: string, key: string, model: string, clear: boolean) => Promise<string>;
   readonly saveGeneral: (url: string, key: string, model: string, clear: boolean) => Promise<string>;
+  readonly selectGeneralModel: (modelId: string) => Promise<boolean>;
+  readonly setLanguage: (language: string) => Promise<void>;
 }
 
 export interface ConnectPresentationActions {
   readonly back: () => void;
+  readonly openAccount: () => void;
   readonly connect: (password?: string) => void;
   readonly clearPairing: () => void;
   readonly urlChanged: (url: string) => void;
@@ -115,8 +122,6 @@ export function emptyAppRootPresentationActions(): AppRootPresentationActions {
     onNavigationBack: () => false,
     onConversationIntent: () => {},
     onCloseSidebar: () => {},
-    onWideConversationSource: () => {},
-    onCompactConversationSource: () => {},
     onCompactLayoutEntered: () => {},
     onLayoutModeChanged: () => {},
     onRemoteHome: {
@@ -125,14 +130,16 @@ export function emptyAppRootPresentationActions(): AppRootPresentationActions {
       selectAssistant: () => {}, cancelWorkspace: () => {}, cancelAssistant: () => {}, queryChanged: () => {},
       search: () => {}, loadMore: () => {}, reconnect: () => {}, disconnect: () => {}, clearPairing: () => {},
       create: () => {}, createInPlace: () => {}, createAssistant: () => {}, createInWorkspace: () => {},
-      createInWorkspaceInPlace: () => {}, openSession: () => {}, openSessionInPlace: () => {}, deleteSession: () => {}
+      createInWorkspaceInPlace: () => {}, toggleDirectoryDevice: () => {}, retryDirectoryDevice: () => {},
+      openSession: () => {}, openSessionInPlace: () => {}, deleteSession: () => {}
     },
     onRemoteCreate: {
       back: () => {}, toggleDevices: () => {}, toggleWorkspaces: () => {}, selectDevice: () => {},
       selectWorkspace: () => {}, draftChanged: () => {}, voiceInput: () => {}, selectModel: () => {}, send: () => {}
     },
     onSidebar: {
-      close: () => {}, newChat: () => {}, enterCode: () => {}, settings: () => {}, openAccount: () => {},
+      close: () => {}, newChat: () => {}, enterCode: () => {}, scanDesktop: () => {}, addDesktop: () => {},
+      settings: () => {}, openAccount: () => {},
       openSession: () => {}, archive: () => {}, exportSession: () => {}, deleteSession: () => {}
     },
     onSettings: {
@@ -141,10 +148,13 @@ export function emptyAppRootPresentationActions(): AppRootPresentationActions {
       cloudListDevices: async () => [], cloudSelectDevice: async () => {},
       getPermissionMode: async () => 'ask',
       setPermissionMode: async (mode: RemotePermissionMode) => mode,
-      testGeneral: async () => '', saveGeneral: async () => ''
+      testGeneral: async () => '', saveGeneral: async () => '',
+      selectGeneralModel: async () => false,
+      setLanguage: async () => {}
     },
     onConnect: {
-      back: () => {}, connect: () => {}, clearPairing: () => {}, urlChanged: () => {}, userChanged: () => {},
+      back: () => {}, openAccount: () => {}, connect: () => {}, clearPairing: () => {},
+      urlChanged: () => {}, userChanged: () => {},
       detected: () => DetectedUrlAction.INVALID, inputVisible: () => {}, paste: () => {}, scan: () => {},
       cloudListDevices: async () => [], cloudSelectDevice: async () => {}
     },

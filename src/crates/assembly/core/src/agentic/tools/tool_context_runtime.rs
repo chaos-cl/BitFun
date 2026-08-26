@@ -37,7 +37,7 @@ use bitfun_agent_runtime::checkpoint::GitStatusCheckpointFacts;
 use bitfun_agent_runtime::checkpoint::{
     build_light_checkpoint as build_runtime_light_checkpoint, LightCheckpointWorkspaceFacts,
 };
-use bitfun_agent_runtime::permission::AUTO_APPROVE_ASK_CONTEXT_KEY;
+use bitfun_agent_runtime::permission::{AUTO_APPROVE_ASK_CONTEXT_KEY, PERMISSION_MODE_CONTEXT_KEY};
 use bitfun_agent_runtime::remote_file_delivery::TOOL_CONTEXT_REMOTE_FILE_DELIVERY_KEY;
 use bitfun_agent_runtime::user_questions::{
     USER_INPUT_AVAILABLE_CONTEXT_KEY, USER_INPUT_MODEL_ROUND_CONTEXT_KEY,
@@ -47,7 +47,9 @@ use bitfun_agent_tools::{
 };
 #[cfg(feature = "canvas-runtime")]
 use bitfun_product_domains::canvas::CanvasStoragePort;
-use bitfun_runtime_ports::{DelegationPolicy, RemoteExecPort, TerminalPort, ToolRuntimeHandles};
+use bitfun_runtime_ports::{
+    DelegationPolicy, PermissionMode, RemoteExecPort, TerminalPort, ToolRuntimeHandles,
+};
 #[cfg(feature = "canvas-runtime")]
 use bitfun_services_integrations::canvas::CanvasService;
 #[cfg(feature = "git")]
@@ -346,6 +348,19 @@ fn build_tool_context_custom_data(context: &ToolExecutionContext) -> HashMap<Str
         deep_review_parent,
         &mut extension_custom_data,
     );
+    // Preserve the turn's already-resolved permission mode for Task
+    // delegation. Without this projection, Task sees only the global default
+    // when it forwards permission context to a fresh subagent.
+    if let Some(mode) = context
+        .context_vars
+        .get(PERMISSION_MODE_CONTEXT_KEY)
+        .and_then(|value| PermissionMode::parse(value))
+    {
+        extension_custom_data.insert(
+            PERMISSION_MODE_CONTEXT_KEY.to_string(),
+            Value::String(mode.as_str().to_string()),
+        );
+    }
     for key in [
         USER_INPUT_AVAILABLE_CONTEXT_KEY,
         AUTO_APPROVE_ASK_CONTEXT_KEY,
@@ -381,21 +396,23 @@ impl ToolUseContext {
         tool_name: &str,
         target: &str,
         touched_files: Vec<String>,
-    ) {
+    ) -> BitFunResult<()> {
         let Some(session_id) = self.session_id.as_deref() else {
-            return;
+            return Ok(());
         };
         let Some(turn_id) = self.dialog_turn_id.as_deref() else {
-            return;
+            return Ok(());
         };
         let Some(coordinator) = get_global_coordinator() else {
-            return;
+            return Ok(());
         };
 
         let checkpoint = self.build_light_checkpoint(touched_files).await;
         coordinator
             .get_session_manager()
-            .record_checkpoint_created(session_id, turn_id, tool_name, target, checkpoint);
+            .record_checkpoint_created(session_id, turn_id, tool_name, target, checkpoint)
+            .await?;
+        Ok(())
     }
 
     async fn build_light_checkpoint(&self, touched_files: Vec<String>) -> EvidenceLedgerCheckpoint {
@@ -1460,6 +1477,7 @@ mod task_context_tests {
     };
     use crate::agentic::tools::ToolRuntimeRestrictions;
     use bitfun_agent_runtime::permission::AUTO_APPROVE_ASK_CONTEXT_KEY;
+    use bitfun_agent_runtime::permission::PERMISSION_MODE_CONTEXT_KEY;
     use bitfun_agent_runtime::user_questions::{
         USER_INPUT_AVAILABLE_CONTEXT_KEY, USER_INPUT_MODEL_ROUND_CONTEXT_KEY,
     };
@@ -1488,6 +1506,10 @@ mod task_context_tests {
         context_vars.insert(
             AUTO_APPROVE_ASK_CONTEXT_KEY.to_string(),
             "false".to_string(),
+        );
+        context_vars.insert(
+            PERMISSION_MODE_CONTEXT_KEY.to_string(),
+            "auto_approve".to_string(),
         );
         context_vars.insert(
             "deep_review_run_manifest".to_string(),
@@ -1592,6 +1614,10 @@ mod task_context_tests {
         assert_eq!(
             context.custom_data[AUTO_APPROVE_ASK_CONTEXT_KEY],
             json!(false)
+        );
+        assert_eq!(
+            context.custom_data[PERMISSION_MODE_CONTEXT_KEY],
+            json!("auto_approve")
         );
         assert_eq!(
             context.custom_data["deep_review_run_manifest"],

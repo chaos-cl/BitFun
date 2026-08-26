@@ -115,6 +115,7 @@ import {
 } from '../main/ets/pages/policy/FilePreviewPlacementPolicy';
 import {
   ConversationLayoutCrease,
+  ConversationLayoutHorizontalCrease,
   ConversationLayoutPolicy,
   ConversationLayoutRect
 } from '../main/ets/pages/policy/ConversationLayoutPolicy';
@@ -140,8 +141,7 @@ import {
   AppNavigationBackAction,
   AppNavigationPathSpec,
   AppRoute,
-  AppRouteContract,
-  ConversationSource
+  AppRouteContract
 } from '../main/ets/pages/navigation/AppRouteContract';
 import { TimeFormat } from '../main/ets/services/TimeFormat';
 import { X25519 } from '../main/ets/services/X25519';
@@ -1299,13 +1299,43 @@ export default function remoteControllersUnitTest() {
           openedSessions.push(session);
         });
 
-      expect(client.createRequests[0]).assertEqual('code::');
+      expect(client.createRequests[0]).assertEqual('code:::');
       expect(created?.sessionId || '').assertEqual('created-session');
       expect(activeSessions.length).assertEqual(2);
       expect(activeSessions[0].sessionId).assertEqual('created-session');
       expect(activeSessions[1].sessionId).assertEqual('opened-session');
       expect(activeSessions[1].workspacePath).assertEqual('/workspace');
       expect(openedSessions.length).assertEqual(2);
+    });
+
+    it('forwards an explicit workspace path without switching the host workspace', 0, async () => {
+      const client = new FakeRemoteSessionClient();
+      client.createdSession = {
+        sessionId: 'created-in-other',
+        title: 'Created Session',
+        workspacePath: '/other',
+        agentType: 'code'
+      };
+      const controller = new RemoteSessionController(client, 8, {
+        onSessions: (_sessions: RemoteSession[], _hasMore: boolean) => {},
+        onActiveSession: (_session: SessionSummary) => {},
+        onStatusText: (_statusText: string) => {},
+        onBusy: (_isBusy: boolean) => {},
+        onLoading: (_isLoading: boolean) => {},
+        onSessionError: (_errorText: string) => {},
+        onReconnecting: () => {},
+        onConnected: () => {},
+        onConnectionFailed: (_err: Object) => {},
+        onStartHeartbeat: () => {}
+      });
+
+      const created = await controller.create(
+        'code', false, true, async (_session: SessionSummary): Promise<void> => {},
+        '', '', '/other'
+      );
+
+      expect(client.createRequests[0]).assertEqual('code:::/other');
+      expect(created?.workspacePath || '').assertEqual('/other');
     });
 
     it('returns no created session when the remote create command fails', 0, async () => {
@@ -2198,24 +2228,29 @@ export default function remoteControllersUnitTest() {
         .assertEqual(AppNavigationBackAction.AllowSystem);
     });
 
-    it('derives conversation sources and wide source destinations', 0, () => {
-      expect(AppRouteContract.conversationSource(AppRoute.ChatHome)).assertEqual(ConversationSource.General);
-      expect(AppRouteContract.conversationSource(AppRoute.GeneralChat)).assertEqual(ConversationSource.General);
-      expect(AppRouteContract.conversationSource(AppRoute.RemoteHome)).assertEqual(ConversationSource.Remote);
-      expect(AppRouteContract.conversationSource(AppRoute.RemoteChat)).assertEqual(ConversationSource.Remote);
+    it('splits remote routes from the general composer without overlap', 0, () => {
+      // The two predicates are complements by construction. Asserting both
+      // directions on every route is what keeps a later edit from creating a
+      // route that is somehow neither, or both.
+      expect(AppRouteContract.isRemoteRoute(AppRoute.ChatHome)).assertFalse();
+      expect(AppRouteContract.isRemoteRoute(AppRoute.GeneralChat)).assertFalse();
+      expect(AppRouteContract.isRemoteRoute(AppRoute.RemoteHome)).assertTrue();
+      expect(AppRouteContract.isRemoteRoute(AppRoute.RemoteCreate)).assertTrue();
+      expect(AppRouteContract.isRemoteRoute(AppRoute.RemoteChat)).assertTrue();
+      expect(AppRouteContract.isGeneralComposerRoute(AppRoute.ChatHome)).assertTrue();
+      expect(AppRouteContract.isGeneralComposerRoute(AppRoute.RemoteCreate)).assertFalse();
+    });
 
-      const general = AppRouteContract.routeForConversationSource(ConversationSource.General, true, 'remote-1');
-      const remoteHome = AppRouteContract.routeForConversationSource(ConversationSource.Remote, false, 'remote-1');
-      const connectedRemoteHome = AppRouteContract.routeForConversationSource(ConversationSource.Remote, true, '');
-      const remoteChat = AppRouteContract.routeForConversationSource(ConversationSource.Remote, true, 'remote-1');
-      expect(general.name).assertEqual(AppRoute.ChatHome);
-      expect(general.hasSessionParam()).assertFalse();
-      expect(remoteHome.name).assertEqual(AppRoute.RemoteHome);
-      expect(remoteHome.hasSessionParam()).assertFalse();
-      expect(connectedRemoteHome.name).assertEqual(AppRoute.RemoteHome);
-      expect(connectedRemoteHome.hasSessionParam()).assertFalse();
-      expect(remoteChat.name).assertEqual(AppRoute.RemoteChat);
-      expect(remoteChat.routeParam().sessionId).assertEqual('remote-1');
+    it('resumes an in-flight remote session instead of landing on the picker', 0, () => {
+      const offline = AppRouteContract.remoteSurfaceDestination(false, 'remote-1');
+      const connectedWithoutSession = AppRouteContract.remoteSurfaceDestination(true, '');
+      const resumable = AppRouteContract.remoteSurfaceDestination(true, 'remote-1');
+      expect(offline.name).assertEqual(AppRoute.RemoteHome);
+      expect(offline.hasSessionParam()).assertFalse();
+      expect(connectedWithoutSession.name).assertEqual(AppRoute.RemoteHome);
+      expect(connectedWithoutSession.hasSessionParam()).assertFalse();
+      expect(resumable.name).assertEqual(AppRoute.RemoteChat);
+      expect(resumable.routeParam().sessionId).assertEqual('remote-1');
     });
 
     it('routes an in-place remote session selection to an explicit chat destination', 0, () => {
@@ -2361,6 +2396,29 @@ export default function remoteControllersUnitTest() {
       session('chat-2', 'Assistant workspace', 'code', '/workspace/notes'),
       session('gone-1', 'Archived', 'code', '/workspace/bitfun', 'archived')
     ];
+
+    it('does not invent a workspace group from a name without a path', 0, () => {
+      const named = inputs([]);
+      named.workspaceName = 'BitFun';
+      named.workspacePath = '';
+      named.recentWorkspaces = [];
+      const projection = SessionListProjector.project(named);
+      expect(projection.projects.length).assertEqual(0);
+    });
+
+    it('does not turn a disconnected placeholder into a workspace group', 0, () => {
+      const disconnected = inputs([
+        session('code-1', 'Cached', 'code', '/workspace/bitfun')
+      ]);
+      disconnected.workspaceName = '未连接';
+      disconnected.workspacePath = '';
+      disconnected.recentWorkspaces = [
+        { path: '/workspace/bitfun', name: 'BitFun', lastOpened: '', workspaceKind: 'normal' }
+      ];
+      const projection = SessionListProjector.project(disconnected);
+      expect(projection.projects.map((item: RecentWorkspaceEntry) => item.name).join(','))
+        .assertEqual('BitFun');
+    });
 
     it('splits chats from project sessions in one pass', 0, () => {
       const projection = SessionListProjector.project(inputs(all));
@@ -2702,13 +2760,13 @@ export default function remoteControllersUnitTest() {
       expect(geometry.collapsedDetailContentWidth).assertEqual(2210);
     });
 
-    it('keeps collapsed tri-fold content on the dominant hinge-free band', 0, () => {
+    it('keeps collapsed tri-fold content full-width so restore stays at the window origin', 0, () => {
       const geometry = ConversationLayoutPolicy.resolveWideGeometry(
         1107,
         [new ConversationLayoutCrease(351, 44)]
       );
-      expect(geometry.collapsedDetailContentOffset).assertEqual(395);
-      expect(geometry.collapsedDetailContentWidth).assertEqual(712);
+      expect(geometry.collapsedDetailContentOffset).assertEqual(0);
+      expect(geometry.collapsedDetailContentWidth).assertEqual(1107);
     });
 
     it('treats dual-axis expanded fold status as an unfolded foldable', 0, () => {
@@ -2733,6 +2791,8 @@ export default function remoteControllersUnitTest() {
         .assertEqual(1107);
       expect(ConversationLayoutPolicy.resolveLayoutViewportWidth(360, 780, 360, 780, 0))
         .assertEqual(360);
+      expect(ConversationLayoutPolicy.resolveLayoutViewportWidth(0, 780, 360, 780, 0))
+        .assertEqual(360);
     });
 
     it('rotates a physical horizontal crease into a vertical layout crease', 0, () => {
@@ -2744,6 +2804,110 @@ export default function remoteControllersUnitTest() {
       expect(creases.length).assertEqual(1);
       expect(creases[0].left).assertEqual(351);
       expect(creases[0].width).assertEqual(44);
+      const vertical = ConversationLayoutPolicy.verticalCreasesFromRects(
+        680,
+        740,
+        [new ConversationLayoutRect(352, 0, 16, 740)]
+      );
+      expect(vertical.length).assertEqual(1);
+      expect(vertical[0].left).assertEqual(352);
+      expect(vertical[0].width).assertEqual(16);
+      const rejected = ConversationLayoutPolicy.verticalCreasesFromRects(
+        680,
+        740,
+        [
+          new ConversationLayoutRect(10, 10, -4, 20),
+          new ConversationLayoutRect(10, 10, 20, -4)
+        ]
+      );
+      expect(rejected.length).assertEqual(0);
+      const emptyViewport = ConversationLayoutPolicy.verticalCreasesFromRects(
+        0,
+        0,
+        [new ConversationLayoutRect(0, 351, 776, 44)]
+      );
+      expect(emptyViewport.length).assertEqual(0);
+      const notARotatedHinge = ConversationLayoutPolicy.verticalCreasesFromRects(
+        680,
+        740,
+        [new ConversationLayoutRect(0, 670, 680, 20)]
+      );
+      expect(notARotatedHinge.length).assertEqual(0);
+      const mateX7Expand = ConversationLayoutPolicy.classifyCreaseRects(
+        707.2,
+        706.56,
+        [new ConversationLayoutRect(0, 340.48, 798.72, 54.72)]
+      );
+      expect(mateX7Expand.vertical.length).assertEqual(1);
+      expect(mateX7Expand.vertical[0].left).assertEqual(340.48);
+      expect(mateX7Expand.vertical[0].width).assertEqual(54.72);
+      expect(mateX7Expand.horizontal.length).assertEqual(0);
+    });
+
+    it('keeps a true horizontal crease on its own axis', 0, () => {
+      const creases = ConversationLayoutPolicy.horizontalCreasesFromRects(
+        390,
+        844,
+        [
+          new ConversationLayoutRect(0, 400, 390, 16),
+          new ConversationLayoutRect(0, 120, 390, -2),
+          new ConversationLayoutRect(-4, 80, -8, 12),
+          new ConversationLayoutRect(10, 200, 40, 80),
+          new ConversationLayoutRect(0, 90, 200, 12),
+          new ConversationLayoutRect(0, 0, 390, 20),
+          new ConversationLayoutRect(0, 830, 390, 20)
+        ]
+      );
+      expect(creases.length).assertEqual(1);
+      expect(creases[0].top).assertEqual(400);
+      expect(creases[0].height).assertEqual(16);
+      const emptyViewport = ConversationLayoutPolicy.horizontalCreasesFromRects(
+        0,
+        844,
+        [new ConversationLayoutRect(0, 220, 200, 12)]
+      );
+      expect(emptyViewport.length).assertEqual(1);
+      expect(emptyViewport[0].top).assertEqual(220);
+      const ordered = ConversationLayoutPolicy.horizontalCreasesFromRects(
+        390,
+        844,
+        [
+          new ConversationLayoutRect(0, 520, 390, 12),
+          new ConversationLayoutRect(0, 180, 390, 12)
+        ]
+      );
+      expect(ordered.length).assertEqual(2);
+      expect(ordered[0].top).assertEqual(180);
+      expect(ordered[1].top).assertEqual(520);
+      expect(new ConversationLayoutHorizontalCrease(180, 12).height).assertEqual(12);
+      const square = ConversationLayoutPolicy.horizontalCreasesFromRects(
+        390,
+        844,
+        [new ConversationLayoutRect(0, 200, 80, 80)]
+      );
+      expect(square.length).assertEqual(0);
+      const zeroHeight = ConversationLayoutPolicy.horizontalCreasesFromRects(
+        390,
+        844,
+        [new ConversationLayoutRect(0, 220, 390, 0)]
+      );
+      expect(zeroHeight.length).assertEqual(1);
+      expect(zeroHeight[0].top).assertEqual(220);
+      expect(zeroHeight[0].height).assertEqual(0);
+      const tallRejected = ConversationLayoutPolicy.horizontalCreasesFromRects(
+        390,
+        844,
+        [new ConversationLayoutRect(10, 80, 16, 400)]
+      );
+      expect(tallRejected.length).assertEqual(0);
+      const trueHorizontal = ConversationLayoutPolicy.classifyCreaseRects(
+        390,
+        844,
+        [new ConversationLayoutRect(0, 400, 390, 16)]
+      );
+      expect(trueHorizontal.vertical.length).assertEqual(0);
+      expect(trueHorizontal.horizontal.length).assertEqual(1);
+      expect(trueHorizontal.horizontal[0].top).assertEqual(400);
     });
 
     it('accepts a zero-width crease without creating an empty detail segment', 0, () => {
@@ -2767,8 +2931,8 @@ export default function remoteControllersUnitTest() {
       expect(geometry.isExtraWide).assertTrue();
       expect(geometry.detailContentOffset).assertEqual(0);
       expect(geometry.detailContentWidth).assertEqual(720);
-      expect(geometry.collapsedDetailContentOffset).assertEqual(360);
-      expect(geometry.collapsedDetailContentWidth).assertEqual(720);
+      expect(geometry.collapsedDetailContentOffset).assertEqual(0);
+      expect(geometry.collapsedDetailContentWidth).assertEqual(1080);
     });
 
     it('keeps asymmetric tri-fold detail on the full remaining span after the first crease', 0, () => {
@@ -2778,8 +2942,8 @@ export default function remoteControllersUnitTest() {
       );
       expect(geometry.detailContentOffset).assertEqual(0);
       expect(geometry.detailContentWidth).assertEqual(720);
-      expect(geometry.collapsedDetailContentOffset).assertEqual(360);
-      expect(geometry.collapsedDetailContentWidth).assertEqual(720);
+      expect(geometry.collapsedDetailContentOffset).assertEqual(0);
+      expect(geometry.collapsedDetailContentWidth).assertEqual(1080);
     });
 
     it('spans remaining screens when a second crease sits inside the detail pane', 0, () => {
@@ -2791,8 +2955,8 @@ export default function remoteControllersUnitTest() {
       expect(geometry.masterDetailGap).assertEqual(44);
       expect(geometry.detailContentOffset).assertEqual(0);
       expect(geometry.detailContentWidth).assertEqual(712);
-      expect(geometry.collapsedDetailContentOffset).assertEqual(395);
-      expect(geometry.collapsedDetailContentWidth).assertEqual(712);
+      expect(geometry.collapsedDetailContentOffset).assertEqual(0);
+      expect(geometry.collapsedDetailContentWidth).assertEqual(1107);
     });
 
     it('uses width as the extra-wide fallback when crease data is missing', 0, () => {

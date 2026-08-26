@@ -22,7 +22,6 @@ use bitfun_agent_runtime::sdk::{
     AgentTurnSettlementPort, AgentTurnSettlementRequest, SessionTranscript,
 };
 use bitfun_core_types::{SESSION_PROVIDER_ACP, SESSION_PROVIDER_METADATA_KEY};
-use bitfun_harness::HarnessRegistry;
 use bitfun_runtime_ports::{
     AgentContextReloadPort, AgentContextReloadRequest, ClockPort, LocalWorkspaceSnapshotPort,
     LocalWorkspaceSnapshotSessionRequest, LocalWorkspaceSnapshotStats,
@@ -78,6 +77,52 @@ fn projected_turn_save_would_overwrite_runtime_state(
     persisted: &DialogTurnData,
     projected: &DialogTurnData,
 ) -> bool {
+    let projected_drops_persisted_content =
+        || {
+            if projected.model_rounds.len() < persisted.model_rounds.len() {
+                return true;
+            }
+            persisted.model_rounds.iter().any(|persisted_round| {
+                let Some(projected_round) = projected
+                    .model_rounds
+                    .iter()
+                    .find(|round| round.id == persisted_round.id)
+                else {
+                    return true;
+                };
+
+                let text_was_shortened =
+                    persisted_round
+                        .text_items
+                        .iter()
+                        .enumerate()
+                        .any(|(index, persisted_item)| {
+                            projected_round.text_items.get(index).is_none_or(|item| {
+                                !item.content.starts_with(&persisted_item.content)
+                            })
+                        });
+                let thinking_was_shortened = persisted_round.thinking_items.iter().enumerate().any(
+                    |(index, persisted_item)| {
+                        projected_round
+                            .thinking_items
+                            .get(index)
+                            .is_none_or(|item| !item.content.starts_with(&persisted_item.content))
+                    },
+                );
+                let tool_was_dropped = persisted_round.tool_items.iter().any(|persisted_tool| {
+                    projected_round
+                        .tool_items
+                        .iter()
+                        .find(|tool| tool.id == persisted_tool.id)
+                        .is_none_or(|tool| {
+                            persisted_tool.tool_result.is_some() && tool.tool_result.is_none()
+                        })
+                });
+
+                text_was_shortened || thinking_was_shortened || tool_was_dropped
+            })
+        };
+
     persisted.recovery.is_some()
         || persisted.recovery_epoch.is_some()
         || projected.recovery.is_some()
@@ -85,7 +130,8 @@ fn projected_turn_save_would_overwrite_runtime_state(
         || (matches!(
             persisted.status,
             TurnStatus::Completed | TurnStatus::Cancelled | TurnStatus::Error
-        ) && projected.status == TurnStatus::InProgress)
+        ) && (projected.status == TurnStatus::InProgress
+            || projected_drops_persisted_content()))
 }
 
 fn merge_runtime_owned_turn_facts(
@@ -565,6 +611,61 @@ impl LocalWorkspaceSnapshotPort for CoreLocalWorkspaceSnapshot {
 /// harnesses; plugin runtime bindings are deliberately not part of this API.
 pub struct CoreProductAgentRuntime;
 
+pub(crate) async fn fork_session_for_plugin(
+    workspace_path: PathBuf,
+    source_session_id: String,
+    source_message_id: Option<String>,
+) -> Result<AgentSessionForkResult, String> {
+    let coordinator = crate::agentic::coordination::get_global_coordinator()
+        .ok_or_else(|| "Session coordinator is not initialized".to_string())?;
+    let scheduler = crate::agentic::coordination::get_global_scheduler()
+        .ok_or_else(|| "Dialog scheduler is not initialized".to_string())?;
+    let path_manager =
+        crate::infrastructure::try_get_path_manager_arc().map_err(|error| error.to_string())?;
+    let token_usage_service = Arc::new(
+        TokenUsageService::new(path_manager)
+            .await
+            .map_err(|error| error.to_string())?,
+    );
+    let operations =
+        CoreSessionOperationsPort::new(coordinator.clone(), scheduler, token_usage_service);
+    match source_message_id {
+        Some(message_id) => {
+            let source_turn_id = coordinator
+                .get_messages(&source_session_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|message| message.id == message_id)
+                .and_then(|message| message.metadata.turn_id)
+                .ok_or_else(|| format!("Source message was not found: {message_id}"))?;
+            AgentSessionForkPort::fork_session_at_turn(
+                &operations,
+                AgentSessionForkAtTurnRequest {
+                    workspace_path: workspace_path.to_string_lossy().into_owned(),
+                    source_session_id,
+                    source_turn_id,
+                    remote_connection_id: None,
+                    remote_ssh_host: None,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+        None => AgentSessionForkPort::fork_session(
+            &operations,
+            AgentSessionForkRequest {
+                workspace_path: workspace_path.to_string_lossy().into_owned(),
+                source_session_id,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string()),
+    }
+}
+
 impl CoreProductAgentRuntime {
     /// Build a narrow session and interaction facade for an existing product
     /// owner. This does not assemble runtime services, harnesses, events, or a
@@ -606,7 +707,6 @@ impl CoreProductAgentRuntime {
         scheduler: Arc<DialogScheduler>,
         token_usage_service: Arc<TokenUsageService>,
         services: RuntimeServices,
-        harness_registry: HarnessRegistry,
     ) -> Result<AgentRuntime, String> {
         Self::build_with_optional_event_source(
             coordinator,
@@ -614,7 +714,6 @@ impl CoreProductAgentRuntime {
             token_usage_service,
             None,
             services,
-            harness_registry,
         )
     }
 
@@ -624,7 +723,6 @@ impl CoreProductAgentRuntime {
         token_usage_service: Arc<TokenUsageService>,
         event_source: AgentEventSource,
         services: RuntimeServices,
-        harness_registry: HarnessRegistry,
     ) -> Result<AgentRuntime, String> {
         Self::build_with_optional_event_source(
             coordinator,
@@ -632,7 +730,6 @@ impl CoreProductAgentRuntime {
             token_usage_service,
             Some(event_source),
             services,
-            harness_registry,
         )
     }
 
@@ -642,7 +739,6 @@ impl CoreProductAgentRuntime {
         token_usage_service: Arc<TokenUsageService>,
         event_source: Option<AgentEventSource>,
         services: RuntimeServices,
-        harness_registry: HarnessRegistry,
     ) -> Result<AgentRuntime, String> {
         let session_operations = Arc::new(CoreSessionOperationsPort::new(
             coordinator.clone(),
@@ -658,7 +754,6 @@ impl CoreProductAgentRuntime {
             session_operations.clone(),
             session_operations,
             services,
-            harness_registry,
         )
     }
 
@@ -669,14 +764,12 @@ impl CoreProductAgentRuntime {
         scheduler: Arc<DialogScheduler>,
         event_source: AgentEventSource,
         services: RuntimeServices,
-        harness_registry: HarnessRegistry,
     ) -> Result<AgentRuntime, String> {
         CoreServiceAgentRuntime::acp_product_agent_runtime(
             coordinator,
             scheduler,
             event_source,
             services,
-            harness_registry,
         )
     }
 
@@ -691,7 +784,6 @@ impl CoreProductAgentRuntime {
         token_usage_service: Arc<TokenUsageService>,
         event_source: AgentEventSource,
         services: RuntimeServices,
-        harness_registry: HarnessRegistry,
     ) -> Result<AgentRuntime, String> {
         let session_operations = Arc::new(CoreSessionOperationsPort::new(
             coordinator.clone(),
@@ -706,7 +798,6 @@ impl CoreProductAgentRuntime {
             session_operations.clone(),
             session_operations,
             services,
-            harness_registry,
         )
     }
 }
@@ -749,6 +840,21 @@ impl CoreAgentRuntimeCompatibility {
     ) -> Result<(), String> {
         self.coordinator
             .start_manual_compaction_turn(session_id, turn_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Cancel a running tool execution on this host.
+    ///
+    /// The controller renders tool cards (e.g. the Terminal card's Interrupt
+    /// button) for Turns this host owns, so it must be able to stop a running
+    /// tool here. This is the per-tool interrupt contract behind the
+    /// `cancel_tool` HostInvoke command; both Desktop and CLI Peer Hosts reach
+    /// the same Core-owned coordinator the local UI does, one level finer than
+    /// `cancel_dialog_turn`.
+    pub async fn cancel_tool(&self, tool_id: &str, reason: String) -> Result<(), String> {
+        self.coordinator
+            .cancel_tool(tool_id, reason)
             .await
             .map_err(|error| error.to_string())
     }
@@ -2018,7 +2124,6 @@ mod tests {
 
     use crate::service::session::SessionTranscriptExportOptions;
     use bitfun_agent_runtime::sdk::{AgentEventSource, AgentRuntime};
-    use bitfun_harness::HarnessRegistry;
     use bitfun_runtime_ports::{
         AgentContextReloadRequest, AgentContextReloadTarget, LocalWorkspaceSnapshotSessionRequest,
         LocalWorkspaceSnapshotTurnRequest,
@@ -2144,6 +2249,39 @@ mod tests {
         assert!(!projected_turn_save_would_overwrite_runtime_state(
             &projected, &projected
         ));
+
+        // Exercise content-loss protection independently from the recovery
+        // ownership guard above.
+        completed.recovery_epoch = None;
+        completed.model_rounds = serde_json::from_value(serde_json::json!([{
+            "id": "round-1",
+            "turnId": "turn-1",
+            "roundIndex": 0,
+            "timestamp": 2,
+            "textItems": [{
+                "id": "runtime-text",
+                "content": "complete authoritative response",
+                "isStreaming": false,
+                "timestamp": 2
+            }],
+            "startTime": 2,
+            "status": "completed"
+        }]))
+        .expect("runtime round");
+        let mut terminal_prefix = completed.clone();
+        terminal_prefix.model_rounds[0].text_items[0].content =
+            "complete authoritative".to_string();
+        assert!(projected_turn_save_would_overwrite_runtime_state(
+            &completed,
+            &terminal_prefix,
+        ));
+
+        terminal_prefix.model_rounds[0].text_items[0].content =
+            "complete authoritative response with UI metadata".to_string();
+        assert!(!projected_turn_save_would_overwrite_runtime_state(
+            &completed,
+            &terminal_prefix,
+        ));
     }
 
     #[test]
@@ -2263,15 +2401,8 @@ mod tests {
             scheduler: Arc<DialogScheduler>,
             token_usage_service: Arc<TokenUsageService>,
             services: RuntimeServices,
-            harness_registry: HarnessRegistry,
         ) -> Result<AgentRuntime, String> {
-            CoreProductAgentRuntime::build(
-                coordinator,
-                scheduler,
-                token_usage_service,
-                services,
-                harness_registry,
-            )
+            CoreProductAgentRuntime::build(coordinator, scheduler, token_usage_service, services)
         }
 
         fn build_with_event_source(
@@ -2280,7 +2411,6 @@ mod tests {
             token_usage_service: Arc<TokenUsageService>,
             event_source: AgentEventSource,
             services: RuntimeServices,
-            harness_registry: HarnessRegistry,
         ) -> Result<AgentRuntime, String> {
             CoreProductAgentRuntime::build_with_event_source(
                 coordinator,
@@ -2288,7 +2418,6 @@ mod tests {
                 token_usage_service,
                 event_source,
                 services,
-                harness_registry,
             )
         }
 

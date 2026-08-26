@@ -11,6 +11,7 @@ import {
   ConnectSheetStep
 } from '../policy/ConnectSheetLandingPolicy';
 import { DetectedUrlAction } from '../../services/ConnectScanDecisionPolicy';
+import { OhosError } from '../../services/OhosError';
 import { CARD, CONNECT_HERO_ACCENT, CONNECT_HERO_BG, CONNECT_HERO_SECONDARY,
   CONNECT_HERO_SURFACE, CONNECT_SCAN_ACCENT, GREEN, INK, LINE, MUTED, PRIMARY_ACTION, PRIMARY_ACTION_TEXT, RED, SOFT,
   SUBTLE } from './Theme';
@@ -37,6 +38,7 @@ export struct ConnectView {
   @Param accountUsername: string = '';
   @Param openIntent: string = CONNECT_INTENT_AUTO;
   @Event onBack: () => void = () => {};
+  @Event onOpenAccount: () => void = () => {};
   @Event onConnect: (password?: string) => void = (_password?: string) => {};
   @Event onRemoteUrlChange: (value: string) => void = (_value: string) => {};
   @Event onUserIdChange: (value: string) => void = (_value: string) => {};
@@ -110,34 +112,46 @@ export struct ConnectView {
         this.BackButton()
       }
       .width('100%')
-      .height(282)
+      .height(250)
 
-      Column({ space: 15 }) {
+      Column({ space: 18 }) {
         this.DesktopGlyph()
-        Text(RemoteI18n.t('connect.obtainPairCode'))
+        Text(RemoteI18n.t('connect.chooseConnectionTitle'))
           .fontSize(24)
           .fontWeight(FontWeight.Bold)
           .fontColor(INK)
           .textAlign(TextAlign.Center)
           .width('100%')
-        Text(RemoteI18n.t('connect.obtainPairCodeBody'))
-          .fontSize(17)
-          .lineHeight(25)
-          .fontColor(MUTED)
-          .textAlign(TextAlign.Center)
-          .width('84%')
-        Text(RemoteI18n.t('connect.obtainPairCodeSteps'))
-          .fontSize(17)
-          .lineHeight(25)
-          .fontColor(MUTED)
-          .textAlign(TextAlign.Center)
-          .width('84%')
+
+        Button(RemoteI18n.t('sidebar.scanToConnect'))
+          .width('82%')
+          .height(58)
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(PRIMARY_ACTION_TEXT)
+          .backgroundColor(PRIMARY_ACTION)
+          .borderRadius(29)
+          .onClick(() => {
+            this.openScannerAfterPermission();
+          })
+
+        Button(RemoteI18n.t('sidebar.signInBitFunAccount'))
+          .width('82%')
+          .height(58)
+          .fontSize(18)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(INK)
+          .backgroundColor(CARD)
+          .border({ width: 1.5, color: LINE })
+          .borderRadius(29)
+          .onClick(() => {
+            this.onOpenAccount();
+          })
       }
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Center)
-      .margin({ top: -10 })
+      .margin({ top: -24 })
 
-      this.PrimaryPairButton(RemoteI18n.t('connect.havePairCode'))
       if (this.inlineScanError.length > 0) {
         Text(this.inlineScanError)
           .fontSize(13)
@@ -168,7 +182,7 @@ export struct ConnectView {
     }
     .width('100%')
     .height('100%')
-    .padding({ bottom: 34 })
+    .padding({ bottom: 28 })
     .backgroundColor(CARD)
   }
 
@@ -356,22 +370,6 @@ export struct ConnectView {
     .width(64)
     .height(64)
     .position({ x, y })
-  }
-
-  @Builder
-  PrimaryPairButton(text: string) {
-    Button(text)
-      .width('82%')
-      .height(58)
-      .fontSize(21)
-      .fontWeight(FontWeight.Bold)
-      .fontColor(PRIMARY_ACTION_TEXT)
-      .backgroundColor(PRIMARY_ACTION)
-      .borderRadius(29)
-      .margin({ bottom: 14 })
-      .onClick(() => {
-        this.openScannerAfterPermission();
-      })
   }
 
   @Builder
@@ -644,12 +642,16 @@ export struct ConnectView {
   }
 
   private async ensureCameraPermission(): Promise<void> {
-    const atManager = abilityAccessCtrl.createAtManager();
-    const context = this.permissionRequestContext();
-    const result = await atManager.requestPermissionsFromUser(context, [CAMERA_PERMISSION]);
-    if (result.authResults.length > 0 &&
-      result.authResults[0] === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
-      return;
+    try {
+      const atManager = abilityAccessCtrl.createAtManager();
+      const context = this.permissionRequestContext();
+      const result = await atManager.requestPermissionsFromUser(context, [CAMERA_PERMISSION]);
+      if (result.authResults.length > 0 &&
+        result.authResults[0] === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+        return;
+      }
+    } catch (err) {
+      throw OhosError.wrap('camera permission', err);
     }
     throw new Error(RemoteI18n.t('errors.permissionDenied'));
   }

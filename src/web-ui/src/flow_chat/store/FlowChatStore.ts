@@ -96,6 +96,7 @@ import { sessionMatchesWorkspace } from '../utils/workspaceScope';
 import { resolveThreadGoalUserMessageDisplay } from '../utils/threadGoalDisplay';
 import { cleanRemoteUserInput } from '../utils/userInputText';
 import { useBackgroundSubagentActivityStore } from './backgroundSubagentActivityStore';
+import { askUserQuestionDraftStore } from './askUserQuestionDraftStore';
 import { sessionComposerStore } from './sessionComposerStore';
 import { completeSessionMutationReconciliation } from './sessionMutationStore';
 import { recordHistorySessionDiagnosticEvent } from '../services/historySessionDiagnostics';
@@ -331,6 +332,7 @@ const HISTORICAL_SESSION_INITIAL_LOCAL_TAIL_TURN_COUNT = 3;
 const HISTORICAL_SESSION_FULL_HISTORY_IDLE_TIMEOUT_MS = 1500;
 const HISTORICAL_SESSION_PREVIOUS_WINDOW_TURN_COUNT = 12;
 const PEER_SESSION_REFRESH_TAIL_TURN_COUNT = 3;
+const SETTLED_TURN_RECONCILE_TAIL_TURN_COUNT = 1;
 const SESSION_TURN_WINDOW_DEFAULT_BEFORE = 4;
 const SESSION_TURN_WINDOW_DEFAULT_AFTER = 12;
 const SESSION_HISTORY_PRESENTATION_SOFT_TURN_BUDGET = 48;
@@ -686,15 +688,57 @@ function snapshotDropsProjectedTurnContent(
     if (!snapshotRound) {
       return true;
     }
-    if (streamProgressEntries(snapshotRound).size < streamProgressEntries(currentRound).size) {
-      return true;
+    const currentStreams = streamProgressEntries(currentRound);
+    const snapshotStreams = streamProgressEntries(snapshotRound);
+    for (const [key, currentItem] of currentStreams) {
+      const snapshotItem = snapshotStreams.get(key);
+      // The same text/thinking item can still be only an earlier checkpoint
+      // prefix. Item counts alone therefore do not make replacement lossless.
+      if (!snapshotItem || !snapshotItem.content.startsWith(currentItem.content)) {
+        return true;
+      }
     }
-    if (toolProgressEntries(snapshotRound).size < toolProgressEntries(currentRound).size) {
-      return true;
+
+    const currentTools = toolProgressEntries(currentRound);
+    const snapshotTools = toolProgressEntries(snapshotRound);
+    for (const [key, currentTool] of currentTools) {
+      const snapshotTool = snapshotTools.get(key);
+      if (!snapshotTool || (currentTool.toolResult && !snapshotTool.toolResult)) {
+        return true;
+      }
     }
   }
 
   return false;
+}
+
+function preserveClientDerivedDisplayItems(
+  current: DialogTurn,
+  persisted: DialogTurn,
+): DialogTurn {
+  let changed = false;
+  const modelRounds = persisted.modelRounds.map(persistedRound => {
+    const currentRound = current.modelRounds.find(round => round.id === persistedRound.id);
+    if (!currentRound) {
+      return persistedRound;
+    }
+    const persistedIds = new Set(persistedRound.items.map(item => item.id));
+    const derivedItems = currentRound.items.filter(item =>
+      item.type === 'tool'
+      && item.id.startsWith('plan-display-')
+      && !persistedIds.has(item.id),
+    );
+    if (derivedItems.length === 0) {
+      return persistedRound;
+    }
+    changed = true;
+    return {
+      ...persistedRound,
+      items: [...persistedRound.items, ...derivedItems],
+    };
+  });
+
+  return changed ? { ...persisted, modelRounds } : persisted;
 }
 
 /**
@@ -5041,6 +5085,7 @@ export class FlowChatStore {
 
     const removedSessionIds = this.removeSession(sessionId, options);
     sessionComposerStore.getState().removeDrafts(removedSessionIds);
+    askUserQuestionDraftStore.getState().removeSessionDrafts(removedSessionIds);
     this.pendingRemoveSessionOptions.delete(sessionId);
   }
 
@@ -5272,6 +5317,7 @@ export class FlowChatStore {
       : [];
     this.surfaceContainers.delete(surfaceId);
     sessionComposerStore.getState().removeSurfaceDrafts(surfaceId);
+    askUserQuestionDraftStore.getState().removeSurfaceDrafts(surfaceId);
     this.forgetSurfaceMetadataRequests(surfaceId);
 
     for (const [requestKey, request] of this.fullHistoryHydrationRequests) {
@@ -7429,6 +7475,7 @@ export class FlowChatStore {
         ? restored.interactionSnapshot.userQuestions
         : undefined;
     let applied = false;
+    let pendingQuestionSnapshotApplied = false;
 
     this.setState(prev => {
       if (
@@ -7522,6 +7569,7 @@ export class FlowChatStore {
           turnsChanged = true;
         }
         if (questionReconciliation.revisionApplied && pendingUserQuestions) {
+          pendingQuestionSnapshotApplied = true;
           this.userQuestionSnapshotRevisions.set(
             sessionId,
             pendingUserQuestions.revision,
@@ -7591,6 +7639,14 @@ export class FlowChatStore {
       };
     });
 
+    if (pendingQuestionSnapshotApplied && pendingUserQuestions) {
+      askUserQuestionDraftStore.getState().reconcilePendingTools(
+        scope.surfaceId,
+        sessionId,
+        pendingUserQuestions.questions.map(question => question.toolId),
+      );
+    }
+
     if (applied) {
       this.seedSessionHistoryLoadedRanges(sessionId, 'initial-tail');
     }
@@ -7609,6 +7665,111 @@ export class FlowChatStore {
           }
         : {}),
     };
+  }
+
+  /**
+   * Repair one terminal Turn from the host's canonical persisted record.
+   *
+   * Runtime chunks are optimized for latency and can be lost while a window is
+   * suspended or a Peer controller reconnects. Once the Runtime has settled,
+   * persistence owns the Turn, so local and device surfaces both perform this
+   * small tail read instead of treating the last painted chunk as complete.
+   */
+  public async reconcileSettledDialogTurn(
+    sessionId: string,
+    turnId: string,
+  ): Promise<boolean> {
+    const scope = getActiveSurfaceScope();
+    const initialSession = this.state.sessions.get(sessionId);
+    const workspacePath = initialSession
+      ? sessionProjectWorkspacePath(initialSession)
+      : undefined;
+    if (!initialSession || !workspacePath) {
+      return false;
+    }
+
+    const restored = await agentAPI.restoreSessionView(
+      sessionId,
+      workspacePath,
+      initialSession.remoteConnectionId,
+      initialSession.remoteSshHost,
+      `settled-turn-${turnId.slice(0, 8)}`,
+      initialSession.sessionKind === 'subagent',
+      SETTLED_TURN_RECONCILE_TAIL_TURN_COUNT,
+    );
+    scope.assertCurrent('reconcileSettledDialogTurn');
+
+    const backendActive = isBackendSessionActivelyProcessing(restored.session.state);
+    const persistedTailTurnId = restored.turns[restored.turns.length - 1]?.turnId;
+    const runtimeSnapshot = coerceRuntimeEventSnapshot(
+      restored.runtimeEventSnapshot,
+      sessionId,
+      backendActive,
+      persistedTailTurnId,
+    );
+    const hostExecutingTurnId = backendActive
+      ? runtimeSnapshot?.activeTurnId ?? persistedTailTurnId
+      : undefined;
+    if (hostExecutingTurnId === turnId) {
+      return false;
+    }
+
+    const incoming = this.convertToDialogTurns(restored.turns)
+      .find(turn => turn.id === turnId);
+    if (
+      !incoming
+      || !['completed', 'cancelled', 'error'].includes(incoming.status)
+    ) {
+      return false;
+    }
+
+    let applied = false;
+    this.setState(prev => {
+      const session = prev.sessions.get(sessionId);
+      if (!session) {
+        return prev;
+      }
+      const turnIndex = session.dialogTurns.findIndex(turn => turn.id === turnId);
+      if (turnIndex < 0) {
+        return prev;
+      }
+      const current = session.dialogTurns[turnIndex];
+      const reconciled = preserveClientDerivedDisplayItems(current, incoming);
+      if (
+        !['completed', 'cancelled', 'error'].includes(current.status)
+        || !persistedReadMayReplaceTurn(
+          sessionId,
+          current,
+          reconciled,
+          hostExecutingTurnId,
+          Boolean(runtimeSnapshot),
+        )
+      ) {
+        return prev;
+      }
+
+      const dialogTurns = [...session.dialogTurns];
+      dialogTurns[turnIndex] = {
+        ...current,
+        ...reconciled,
+        tokenUsage: reconciled.tokenUsage ?? current.tokenUsage,
+        success: reconciled.success ?? current.success,
+        finishReason: reconciled.finishReason ?? current.finishReason,
+        hasFinalResponse: reconciled.hasFinalResponse ?? current.hasFinalResponse,
+      };
+      const sessions = new Map(prev.sessions);
+      sessions.set(sessionId, {
+        ...session,
+        dialogTurns,
+      });
+      applied = true;
+      return {
+        ...prev,
+        sessions,
+      };
+    });
+
+    return applied;
   }
 
   /** Empty the current Turn so journal replay cannot overlap a persist checkpoint. */
@@ -7641,7 +7802,9 @@ export class FlowChatStore {
     sessionId: string,
     pendingUserQuestions: PendingUserQuestionSnapshot | undefined,
   ): boolean {
+    const surfaceId = getActiveSurfaceId();
     let applied = false;
+    let pendingQuestionSnapshotApplied = false;
     this.setState(prev => {
       const session = prev.sessions.get(sessionId);
       if (!session) {
@@ -7654,6 +7817,7 @@ export class FlowChatStore {
         previousRevision,
       );
       if (reconciliation.revisionApplied && pendingUserQuestions) {
+        pendingQuestionSnapshotApplied = true;
         this.userQuestionSnapshotRevisions.set(sessionId, pendingUserQuestions.revision);
       }
       if (!reconciliation.changed) {
@@ -7668,6 +7832,13 @@ export class FlowChatStore {
       applied = true;
       return { ...prev, sessions };
     });
+    if (pendingQuestionSnapshotApplied && pendingUserQuestions) {
+      askUserQuestionDraftStore.getState().reconcilePendingTools(
+        surfaceId,
+        sessionId,
+        pendingUserQuestions.questions.map(question => question.toolId),
+      );
+    }
     return applied;
   }
 

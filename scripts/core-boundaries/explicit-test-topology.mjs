@@ -7,11 +7,6 @@ export const agentRuntimeIntegrationTestTargets = [
   { name: 'agent_long_horizon_contracts', path: 'tests/agent_long_horizon_contracts.rs', requiredFeatures: ['agent-runtime'] },
   { name: 'agent_session_contracts', path: 'tests/agent_session_contracts.rs', requiredFeatures: ['agent-runtime'] },
   {
-    name: 'deep_research_contracts',
-    path: 'tests/deep_research_contracts.rs',
-    requiredFeatures: ['deep-research'],
-  },
-  {
     name: 'native_hook_execution_contracts',
     path: 'tests/native_hook_execution_contracts.rs',
     requiredFeatures: ['native-hook-runtime'],
@@ -23,8 +18,17 @@ export const agentRuntimeIntegrationTestTargets = [
   },
 ];
 
+export const agentWorkflowsIntegrationTestTargets = [
+  {
+    name: 'deep_research_contracts',
+    path: 'tests/deep_research_contracts.rs',
+    forbidRequiredFeatures: true,
+  },
+];
+
 export const cliIntegrationTestTargets = [
   { name: 'acp_stdio_cli', path: 'tests/acp_stdio_cli.rs' },
+  { name: 'app_server_stdio_cli', path: 'tests/app_server_stdio_cli.rs' },
   { name: 'cli_command_contracts', path: 'tests/cli_command_contracts.rs' },
   { name: 'terminal_process_contracts', path: 'tests/terminal_process_contracts.rs' },
 ];
@@ -234,6 +238,7 @@ export const productCapabilitiesIntegrationTestTargets = [
       'tests/product_capability_contracts/plugin_product_shape.rs',
       'tests/product_capability_contracts/product_capabilities.rs',
       'tests/product_capability_contracts/product_sdk_assembly.rs',
+      'tests/product_capability_contracts/runtime_boundary.rs',
     ],
     forbidRequiredFeatures: true,
   },
@@ -901,6 +906,7 @@ export function checkBuildGraphContractIntegrationTestTopologies(root) {
     ['src/crates/contracts/core-types', coreTypesIntegrationTestTargets],
     ['src/crates/contracts/runtime-ports', runtimePortsIntegrationTestTargets],
     ['src/crates/contracts/product-domains', productDomainsIntegrationTestTargets],
+    ['src/crates/execution/agent-workflows', agentWorkflowsIntegrationTestTargets],
     [
       'src/crates/adapters/ai-adapters',
       aiAdaptersIntegrationTestTargets,
